@@ -419,7 +419,10 @@ class LimitCheckRequest(BaseModel):
     window_ms: int = Field(
         ge=1,
         examples=[1000],
-        description="滑动窗口长度（毫秒）",
+        description=(
+            "滑动窗口长度（毫秒）。同一 client_key 可交替使用不同窗口："
+            "成本记录按服务端允许的最大窗口保留，每次请求只按本次窗口判定"
+        ),
     )
     cost: int = Field(
         default=1,
@@ -454,7 +457,10 @@ class LimitCheckResponse(BaseModel):
     window_ms: int = Field(description="本次判定使用的滑动窗口长度（毫秒）")
     remaining: int = Field(
         ge=0,
-        description="放行后窗口内剩余可用成本；超限时为不扣减情况下的剩余值",
+        description=(
+            "放行后窗口内剩余可用成本；超限时为不扣减情况下的剩余值"
+            "（不同 window_ms 混用致窗口内累计已超限时为 0）"
+        ),
     )
     reset_at_ms: int = Field(
         description=(

@@ -1060,10 +1060,17 @@ async def check_limit(
     重试请求以首次结果为准，不会重新判定参数与额度；需要发起新的逻辑
     请求时请使用新的 `request_id`。不传 `request_id` 时行为与旧版本一致。
 
-    "幂等判定 → 清理旧记录 → 累计 → 判定 → 扣减 → 记录响应"由单个 Lua
-    脚本基于 Redis 服务器时间原子执行，同一 `client_key` 的并发请求不会
-    超额，相同 `request_id` 的并发请求只有首个完成扣减；窗口数据随滑动
-    自动清理，键在窗口清空后按 `PEXPIRE` 自动删除。
+    **不同 window_ms 混用**：同一 `client_key` 可交替使用不同的
+    `window_ms`；成本记录按服务端允许的最大窗口（`LIMITS_MAX_WINDOW_MS`）
+    保留，每次请求只按本次 `window_ms` 筛选累计并判定——短窗口请求不会
+    删除仍属于更长窗口的记录，切回长窗口后旧记录仍被正确计入。过期清理
+    与限流键的兜底 `PEXPIRE` 同样按最大允许窗口计算。
+
+    "幂等判定 → 清理旧记录 → 按本次窗口筛选累计 → 判定 → 扣减 → 记录响应"
+    由单个 Lua 脚本基于 Redis 服务器时间原子执行，同一 `client_key` 的
+    并发请求不会超额，相同 `request_id` 的并发请求只有首个完成扣减；
+    滑出最大允许窗口的记录随请求自动清理，无流量时键按兜底 `PEXPIRE`
+    自动删除。
     """
     window = resolve_window(req.window_ms, settings)
     keys = [limit_key(settings, req.client_key)]
@@ -1071,7 +1078,13 @@ async def check_limit(
         keys.append(idempotency_key(settings, req.client_key, req.request_id))
     result = await scripts.limit_check(
         keys=keys,
-        args=[req.limit, window, req.cost, uuid.uuid4().hex],
+        args=[
+            req.limit,
+            window,
+            req.cost,
+            uuid.uuid4().hex,
+            settings.limits_max_window_ms,
+        ],
     )
 
     kind = result[0]

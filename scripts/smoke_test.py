@@ -33,6 +33,10 @@ request_id 跨窗口可复用 / 非法 request_id 拒绝；
 （等到成本 4 滑出而非仅最早的成本 1），reset_at_ms 仍为最老记录滑出、
 按旧等待时长重试仍 429 / 等到位后放行，同毫秒到期记录合并判断
 （直连 Redis 构造同分记录验证）；
+以及同一 client_key 混用不同 window_ms：长窗口放入的记录不被随后的
+短窗口检查删除，切回长窗口后仍被计入并 429（窗口内累计超限时
+remaining 按 0 返回、reset_at_ms 仍跟踪最老记录），最老记录滑出
+长窗口后恢复放行；
 以及任务依赖门禁：
 无定义即可执行 / 保存去重且限 16 个 / 自身依赖 422 /
 环检测只遍历现有定义且拒绝时保留原定义 / 空列表清除 /
@@ -1303,6 +1307,7 @@ def limit_checks():
 
     idempotency_checks()
     limit_retry_after_checks()
+    limit_mixed_window_checks()
 
 
 def idempotency_checks():
@@ -1561,6 +1566,57 @@ def limit_retry_after_checks():
               f"Retry-After={headers.get('Retry-After')} body={dm}")
     finally:
         r.close()
+
+
+def limit_mixed_window_checks():
+    """/v1/limits/check 同一 client_key 混用不同 window_ms 的回归：
+
+    长窗口放入的记录不得被随后的短窗口检查删除（旧实现按本次窗口
+    ZREMRANGEBYSCORE 清旧并缩短键 TTL，会丢掉仍属于长窗口的记录，
+    切回长窗口后错误放行）；记录按服务端最大允许窗口保留，
+    每次请求只按本次 window_ms 筛选判定。"""
+    base = f"smoke-limit-mixed:{int(time.time() * 1000)}"
+    path = "/v1/limits/check"
+    key = f"{base}:k"
+
+    # 长窗口（2 秒）先放行一笔 cost=2（limit=2，长窗口已打满）
+    code, b1 = call("POST", path, {"client_key": key, "limit": 2,
+                                   "window_ms": 2_000, "cost": 2})
+    check("mixed long-window allow cost 2",
+          code == 200 and b1["allowed"] and b1["remaining"] == 0, f"{code} {b1}")
+
+    time.sleep(1.0)  # 首笔记录滑出 300ms 短窗口，但仍在 2 秒长窗口内
+
+    # 短窗口（300ms）检查：首笔记录不在短窗口内 -> 放行；
+    # 关键：本次不得删除仍属于长窗口的首笔记录
+    code, b2 = call("POST", path, {"client_key": key, "limit": 2,
+                                   "window_ms": 300, "cost": 1})
+    check("mixed short-window allow (record outside short window)",
+          code == 200 and b2["allowed"] and b2["remaining"] == 1, f"{code} {b2}")
+
+    # 切回长窗口：两笔记录都在窗内（累计 3 > 2）-> 必须 429；
+    # 旧实现中短窗口检查已删除首笔记录，此处会错误放行
+    code, headers, b3 = call_ex("POST", path, {"client_key": key, "limit": 2,
+                                               "window_ms": 2_000, "cost": 1})
+    check("mixed back to long window -> 429",
+          code == 429 and not b3["allowed"], f"{code} {b3}")
+    # 窗口内累计（3）已超过 limit（2）：remaining 不得为负，按 0 返回
+    check("mixed remaining clamped at 0", b3["remaining"] == 0, f"{b3}")
+    # reset_at_ms 仍是首笔（最老）记录滑出长窗口的时刻，与首次响应一致
+    check("mixed reset_at tracks oldest record",
+          b3["reset_at_ms"] == b1["reset_at_ms"], f"{b1} {b3}")
+    check("mixed retry_after positive", b3["retry_after_ms"] > 0, f"{b3}")
+    check("mixed Retry-After header",
+          headers.get("Retry-After") is not None
+          and int(headers["Retry-After"]) >= 1,
+          f"Retry-After={headers.get('Retry-After')}")
+
+    # 首笔记录滑出长窗口后（第二笔仍在窗内，used=1）：长窗口放行且 remaining=0
+    time.sleep(1.4)
+    code, b4 = call("POST", path, {"client_key": key, "limit": 2,
+                                   "window_ms": 2_000, "cost": 1})
+    check("mixed long-window recovers after oldest slides out",
+          code == 200 and b4["allowed"] and b4["remaining"] == 0, f"{code} {b4}")
 
 
 def set_dependencies(k, deps):
