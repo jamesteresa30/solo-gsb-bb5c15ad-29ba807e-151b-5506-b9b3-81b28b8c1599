@@ -37,8 +37,11 @@
 按 Redis 服务器时间累计滑动窗口内的请求成本，未超限则原子扣减并返回剩余额度，
 超限返回 `429` 与建议重试时间——按记录到期顺序累计释放的成本、首次足以容纳
 本次 `cost` 的等待毫秒数（同毫秒到期合并判断），避免加权场景下"只等最老一笔、
-届时额度仍不足"的过早重试；同一 `client_key` 的并发请求不会超额，过期窗口
-数据自动清理。请求还可携带可选 `request_id` 实现**窗口内请求幂等**：相同
+届时额度仍不足"的过早重试；同一 `client_key` 的并发请求不会超额。同一
+`client_key` 还可交替使用不同的 `window_ms`：成本记录按最大允许窗口
+（`LIMITS_MAX_WINDOW_MS`）保留，过期清理与键 TTL 都不会提前删除仍属于更长
+窗口的记录，每次请求只按本次 `window_ms` 累计窗口内成本。请求还可携带可选
+`request_id` 实现**窗口内请求幂等**：相同
 `client_key` + `request_id` 的并发或重试请求直接返回首次判定结果且不重复扣减，
 `request_id` 仅在对应窗口内存活，跨窗口可再次使用。
 
@@ -721,6 +724,21 @@ curl -i -X POST localhost:8000/v1/limits/check \
 # reset_at_ms 仍是"最老一笔滑出"的时刻（语义不变）；retry_after_ms 可能更晚，
 # 同毫秒到期的记录合并累计判断。按它等待后重试不会因额度仍不足而再次 429。
 
+# 混合窗口：同一 client_key 可交替使用不同 window_ms。长窗口放行的成本记录
+# 按最大允许窗口（LIMITS_MAX_WINDOW_MS）保留，短窗口检查不会删除它：
+curl -s -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:mixed", "limit": 3, "window_ms": 60000, "cost": 3}'
+# => 200（长窗口 60s 打满）
+curl -s -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:mixed", "limit": 3, "window_ms": 1000, "cost": 1}'
+# => 200（成本 3 的记录不在 1s 短窗口内，按本次窗口放行；该记录仍被保留）
+curl -i -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:mixed", "limit": 3, "window_ms": 60000, "cost": 1}'
+# => 429（切回长窗口，成本 3 的记录仍计入额度，不会错误放行）
+
 # request_id 幂等：相同 client_key + request_id 在窗口内只扣减一次。
 # 首次请求正常判定（假设通过）：
 curl -s -X POST localhost:8000/v1/limits/check \
@@ -754,7 +772,7 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `client_key` | 请求 | 限流对象标识（1～512 字符），任意维度（租户 / 用户 / API） |
 | `request_id` | 请求 | 可选幂等标识（1～128 字符，仅允许字母、数字、`._:-`）。同一 `client_key` + `request_id` 在首次请求的窗口内只扣减一次，重试 / 并发请求回放首次结果；窗口结束后自动失效、可再次使用。不传时行为与旧版本一致 |
 | `limit` | 请求 | 单个窗口内允许累计的成本上限（≥1） |
-| `window_ms` | 请求 | 滑动窗口长度（毫秒，服务端限定 1～86400000），同时决定幂等记录的存活时长 |
+| `window_ms` | 请求 | 滑动窗口长度（毫秒，服务端限定 1～86400000），同时决定幂等记录的存活时长；同一 `client_key` 可逐请求使用不同窗口，成本记录按最大允许窗口保留，每次只累计本次窗口内的成本 |
 | `cost` | 请求 | 本次成本（≥1，默认 1，且不得大于 `limit`） |
 | `request_id` | 响应 | 原样回显请求携带的幂等标识；未携带时为 `null` |
 | `idempotent_replay` | 响应 | `true` 表示本次为幂等回放（未重复扣减），响应头同时带 `Idempotent-Replay: true`；默认 `false` |
@@ -932,14 +950,21 @@ curl -i -X POST localhost:8000/v1/limits/check \
   `ZREMRANGEBYSCORE` 清旧 → 遍历 member 累计成本 → 判定 → `ZADD` 扣减，
   Redis 单线程执行脚本，同一 `client_key` 的并发请求严格串行判定，
   不会出现"检查后扣减"的竞态，**并发请求绝不超额**（超限时不写入任何成本）。
+- **混合窗口**：同一 `client_key` 可交替使用不同的 `window_ms`。成本记录
+  按**最大允许窗口**（`LIMITS_MAX_WINDOW_MS`，由服务端随每次调用传入脚本）
+  保留：清旧只删除连最大允许窗口都已滑出的记录，键的 `PEXPIRE` 同样按最大
+  允许窗口设置——短窗口请求**不会删除仍属于长窗口的记录**，也不会把键 TTL
+  收缩到短窗口；每次请求只按本次 `window_ms` 筛选窗口内记录累计成本、计算
+  `reset_at_ms` 与 `retry_after_ms`，窗口外的保留记录不影响本次判定，但会
+  在后续更长窗口的请求中继续计入，切回长窗口不会错误放行。
 - **成本加权**：每笔请求携带整数 `cost`（批量条数、令牌数等），
   member 形如 `<uuid>:<cost>`，cost 编码在 member 尾部由脚本解析累计；
   uuid 保证同一毫秒并发请求的 member 不冲突。
 - **Redis 服务器时间**：窗口边界由 Lua 内 `TIME` 命令的服务器时钟确定，
   不依赖调用方本地时间；`reset_at_ms` / `retry_after_ms` 均基于该时钟计算。
-- **过期数据自动清理**：滑出窗口的记录在下次检查时被 `ZREMRANGEBYSCORE`
-  即时删除，键同时设置 `PEXPIRE window_ms`，窗口结束后无流量时键也会自动消失，
-  不残留空窗口数据。
+- **过期数据自动清理**：滑出最大允许窗口的记录在下次检查时被
+  `ZREMRANGEBYSCORE` 即时删除，键同时设置 `PEXPIRE`（最大允许窗口），
+  记录全部滑出且无流量时键也会自动消失，不残留空窗口数据。
 - **超限语义**：超限时返回 `429`，响应体给出 `remaining`、`reset_at_ms`
   （最老一笔成本滑出的时刻，语义不变）与 `retry_after_ms`，并携带标准
   `Retry-After` 头（秒，向上取整）。`retry_after_ms` 按记录到期顺序累计
@@ -970,7 +995,7 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `{prefix}:result:{task_key}` | Hash（`result` / `fencing` / `committed_at_ms`），**无 TTL** | 最近一次已提交任务结果及其防栅序号，不随租约到期删除 |
 | `{prefix}:result-changes` | Stream（所有任务键共用），条目含 `task_key` / `fencing` / `committed_at_ms` / `result`，`XADD MAXLEN` 裁剪 | 全局任务结果变更流：仅首次写入新结果版本时于提交同一 Lua 脚本内原子追加，按写入全局定序，保留最新 `LEASE_RESULT_CHANGE_RETENTION` 条 |
 | `{prefix}:deps:{task_key}` | List（元素为前置任务键，去重、最多 16 个，按请求顺序；键不存在即无定义） | 任务依赖门禁定义；保存前 Lua 沿现有 List 做环检测（去重访问 ≤1024），拒绝保留原定义 |
-| `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
+| `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，PEXPIRE=最大允许窗口（`LIMITS_MAX_WINDOW_MS`） | 各笔成本记录；同一 `client_key` 不同 `window_ms` 共用同一 ZSet，记录按最大允许窗口保留，每次请求只累计本次窗口内的成本 |
 | `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
 | `{prefix}:capacity:{resource_key}` | String（整数权重容量），**无 TTL** | 资源键的并发容量配置；未配置即不可申请；下调低于有效占用时拒绝、保留原值 |
 | `{prefix}:slots:{resource_key}` | ZSet，member=凭据 `<uuid32>:<weight>`，score=到期毫秒，带兜底 PEXPIRE | 资源键当前有效占用；凭据即 member，续期 / 释放只认完整凭据 |
@@ -1008,7 +1033,10 @@ limit 笔不超额**、参数校验和过期数据自动清理；以及**加权�
 limit=5 窗口内先后通过成本 1 与 4 后成本 3 被拒，`retry_after_ms` 按记录
 到期顺序累计释放、首次足以容纳本次成本（等到成本 4 滑出而非仅最早的成本 1，
 `reset_at_ms` 仍为最老记录滑出），按旧等待时长重试仍 429、等到位后放行，
-同毫秒到期记录合并判断（直连 Redis 构造同分记录验证）；以及 `request_id` 幂等：
+同毫秒到期记录合并判断（直连 Redis 构造同分记录验证）；以及**混合窗口**：
+同一 `client_key` 长窗口放行后换短窗口检查，仍属长窗口的成本记录不丢失
+（直连 Redis 验证记录与键 TTL 不按短窗口收缩）、切回长窗口仍计入额度
+（429）、每次只按本次窗口累计、长窗口滑出后恢复；以及 `request_id` 幂等：
 重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
 **20 个携带相同 request_id 的并发请求只扣减一次**、429 结果原样回放、
 `request_id` 跨窗口可再次使用、幂等作用域按 `client_key` 隔离、

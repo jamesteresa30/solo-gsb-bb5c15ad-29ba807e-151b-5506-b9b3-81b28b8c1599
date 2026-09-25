@@ -28,6 +28,13 @@
 - 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
   member 形如 "<uuid>:<cost>"，cost 编码在 member 尾部，
   uuid 保证同毫秒并发请求的 member 不冲突。
+- 同一 client_key 允许交替使用不同的 window_ms：成本记录按
+  "最大允许窗口"（LIMITS_MAX_WINDOW_MS，由服务端随每次调用传入）
+  保留——过期清理只删除连最大允许窗口都已滑出的记录，键 TTL 同样
+  按最大允许窗口设置，因此短窗口请求不会删除仍属于长窗口的记录；
+  每次请求只按本次 window_ms 筛选窗口内记录累计成本、计算
+  reset_at_ms 与 retry_after_ms，窗口外的保留记录不影响本次判定，
+  但会在后续更长窗口的请求中继续计入。
 - 拒绝时的 retry_after_ms 不是"最老一笔滑出"：按记录到期顺序累计
   将释放的成本（同毫秒到期的记录同一时刻一起滑出，合并累计判断），
   取首次足以容纳本次 cost 的等待毫秒数，避免过早重试再次 429；
@@ -732,6 +739,12 @@ return reply
 # 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
 # member 形如 "<唯一标识>:<cost>"，同一毫秒内的并发请求也不会互相覆盖；
 # 每笔成本直接编码在 member 尾部，无需额外的键。
+# 同一 client_key 可交替使用不同的 window_ms：记录按最大允许窗口
+# （ARGV[5]，即服务端 LIMITS_MAX_WINDOW_MS）保留——过期清理只删除连
+# 最大允许窗口都已滑出的记录，键 TTL 也按最大允许窗口设置，短窗口请求
+# 不会删除仍属于长窗口的成本记录；每次请求只按本次 window_ms 筛选窗口内
+# 记录累计成本并计算 reset_at_ms / retry_after_ms，窗口外的保留记录
+# 不影响本次判定，但会在后续更长窗口的请求中继续计入。
 # 幂等键是一个 Hash（仅携带 request_id 时传入 KEYS[2]）：
 #   allowed / remaining / reset_at / retry_after / limit / window
 # 保存首次请求的完整判定结果，PEXPIRE = 首次请求的 window_ms，
@@ -740,14 +753,15 @@ return reply
 # KEYS[1] = 限流 ZSet 键
 # KEYS[2] = 幂等 Hash 键（可选；未携带 request_id 时不传入）
 # ARGV[1] = limit（窗口内允许的成本上限）
-# ARGV[2] = window_ms
+# ARGV[2] = window_ms（本次请求的窗口）
 # ARGV[3] = cost（本次请求成本）
 # ARGV[4] = 唯一标识（uuid hex，保证 member 不冲突）
+# ARGV[5] = 最大允许窗口 ms（记录保留与键 TTL 的统一口径）
 # 幂等命中返回 {2, allowed, remaining, reset_at, retry_after, limit, window}
 #   （直接回传首次结果，不清理 / 不判定 / 不扣减 / 不刷新任何 TTL）
 # 首次放行返回 {1, remaining, reset_at_ms}
 # 首次超限返回 {0, remaining, reset_at_ms, retry_after_ms}
-# reset_at_ms 为窗口内最老一笔成本滑出的时刻；窗口为空时取 now + window_ms。
+# reset_at_ms 为本次窗口内最老一笔成本滑出的时刻；窗口为空时取 now + window_ms。
 # retry_after_ms 为按记录到期顺序累计释放的成本首次足以容纳本次 cost 的
 # 等待毫秒数（同毫秒到期的记录合并累计判断），可能晚于 reset_at_ms：
 # 最老一笔滑出释放的成本未必容得下本次 cost（如窗口内 1+4、limit=5、
@@ -771,44 +785,59 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local limit = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
 local cost = tonumber(ARGV[3])
+local max_window = tonumber(ARGV[5])
 
 local window_start = now - window
+local retain_start = now - max_window
 
--- 清理已滑出窗口的旧记录，ZSet 中只保留当前窗口内的成本
-redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+-- 只清理已滑出最大允许窗口的旧记录：同一 client_key 可能交替使用不同
+-- window_ms，早于本次窗口、但仍处于最大允许窗口内的记录必须保留，
+-- 供后续更长窗口的请求继续累计，不得在此删除
+redis.call('ZREMRANGEBYSCORE', key, '-inf', retain_start)
 
--- 按 score（请求时刻）升序取出全部在窗记录：既从 member 尾部解析成本
--- 累计 used，也供拒绝时按到期顺序计算"累计释放多少成本"的等待时长
+-- 按 score（请求时刻）升序取出全部保留记录：只累计落在本次窗口内的成本
+-- （同时收集窗口内记录，供拒绝时按到期顺序计算"累计释放多少成本"的
+-- 等待时长）；窗口外的记录本次不计入，但仍留在 ZSet 中供更长窗口使用
 local entries = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
 local used = 0
+local in_window = {}
 for i = 1, #entries, 2 do
-  used = used + tonumber(string.match(entries[i], ':(%d+)$'))
+  local score = tonumber(entries[i + 1])
+  if score > window_start then
+    used = used + tonumber(string.match(entries[i], ':(%d+)$'))
+    in_window[#in_window + 1] = entries[i]
+    in_window[#in_window + 1] = score
+  end
 end
 
 local reset_at
-if #entries == 0 then
+if #in_window == 0 then
   reset_at = now + window
 else
-  reset_at = tonumber(entries[2]) + window
+  reset_at = in_window[2] + window
 end
 
 local allowed, remaining, retry_after
 if used + cost > limit then
   allowed = 0
+  -- 记录按最大允许窗口保留后，窗口内累计成本可能超过本次 limit
+  -- （如长窗口大额记录仍在窗内、本次以更小 limit 检查），剩余额度不为负
   remaining = limit - used
-  -- 需要窗口内累计滑出 need 成本才容得下本次请求：按到期时刻（score
+  if remaining < 0 then remaining = 0 end
+  -- 需要本次窗口内累计滑出 need 成本才容得下本次请求：按到期时刻（score
   -- 升序）逐组合计将释放的成本——同毫秒（同 score）到期的记录在同一
   -- 时刻一起滑出，必须合并成一组判断——首个使累计释放量达到 need 的
-  -- 到期时刻即为等待终点，避免"只等最老一笔、届时额度仍不足"的过早重试
+  -- 到期时刻即为等待终点，避免"只等最老一笔、届时额度仍不足"的过早重试；
+  -- 只统计本次窗口内的记录，窗口外的保留记录与本窗口额度无关
   local need = used + cost - limit
   local released = 0
   retry_after = reset_at - now  -- 兜底；cost <= limit 保证下面循环必然命中
   local i = 1
-  while i <= #entries do
-    local expire_score = tonumber(entries[i + 1])
+  while i <= #in_window do
+    local expire_score = in_window[i + 1]
     local j = i
-    while j <= #entries and tonumber(entries[j + 1]) == expire_score do
-      released = released + tonumber(string.match(entries[j], ':(%d+)$'))
+    while j <= #in_window and in_window[j + 1] == expire_score do
+      released = released + tonumber(string.match(in_window[j], ':(%d+)$'))
       j = j + 2
     end
     if released >= need then
@@ -823,7 +852,9 @@ else
   retry_after = 0
   redis.call('ZADD', key, now, ARGV[4] .. ':' .. cost)
 end
-redis.call('PEXPIRE', key, window)
+-- 键 TTL 按最大允许窗口设置：保留的记录可能仍属于后续更长窗口，
+-- 不得因本次窗口较短而提前过期丢失；无流量时键随最大允许窗口自然回收
+redis.call('PEXPIRE', key, max_window)
 
 -- 首次请求：连同 limit / window 一起记录完整响应，TTL = window_ms，
 -- 使 request_id 恰好存活到该窗口结束

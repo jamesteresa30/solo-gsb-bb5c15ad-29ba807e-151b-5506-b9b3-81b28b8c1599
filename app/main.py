@@ -1044,11 +1044,18 @@ async def check_limit(
     """按 Redis 服务器时间统计滑动窗口内的累计成本并原子扣减。
 
     - 未超限（`used + cost <= limit`）：原子记入本次成本，返回 **200**、
-      `remaining` 与 `reset_at_ms`（窗口内最老一笔成本滑出的时刻）。
+      `remaining` 与 `reset_at_ms`（本次窗口内最老一笔成本滑出的时刻）。
     - 超限：不扣减，返回 **429** 与 `retry_after_ms`——按记录到期顺序累计
       将释放的成本，首次足以容纳本次 `cost` 的等待毫秒数（同毫秒到期的记录
       合并判断；可能晚于 `reset_at_ms`，最老一笔滑出未必释放足够额度），
       同时携带标准 `Retry-After` 响应头（秒）。
+
+    **混合窗口**：同一 `client_key` 可交替使用不同的 `window_ms`。成本记录
+    按服务端最大允许窗口（`LIMITS_MAX_WINDOW_MS`）保留：过期清理只删除连
+    最大允许窗口都已滑出的记录，键 TTL 同样按最大允许窗口设置，因此短窗口
+    请求**不会删除仍属于长窗口的成本记录**；每次请求只按本次 `window_ms`
+    筛选窗口内记录累计成本并计算 `reset_at_ms` / `retry_after_ms`，窗口外
+    的保留记录不影响本次判定，但会在后续更长窗口的请求中继续计入。
 
     **可选幂等（request_id）**：请求体携带 `request_id` 时，同一
     `client_key` + `request_id` 在其首次请求的窗口内只判定 / 扣减一次，
@@ -1060,10 +1067,10 @@ async def check_limit(
     重试请求以首次结果为准，不会重新判定参数与额度；需要发起新的逻辑
     请求时请使用新的 `request_id`。不传 `request_id` 时行为与旧版本一致。
 
-    "幂等判定 → 清理旧记录 → 累计 → 判定 → 扣减 → 记录响应"由单个 Lua
+    "幂等判定 → 清理过期记录 → 累计 → 判定 → 扣减 → 记录响应"由单个 Lua
     脚本基于 Redis 服务器时间原子执行，同一 `client_key` 的并发请求不会
-    超额，相同 `request_id` 的并发请求只有首个完成扣减；窗口数据随滑动
-    自动清理，键在窗口清空后按 `PEXPIRE` 自动删除。
+    超额，相同 `request_id` 的并发请求只有首个完成扣减；窗口数据按最大
+    允许窗口自动清理，键在无流量后按 `PEXPIRE` 自动删除。
     """
     window = resolve_window(req.window_ms, settings)
     keys = [limit_key(settings, req.client_key)]
@@ -1071,7 +1078,13 @@ async def check_limit(
         keys.append(idempotency_key(settings, req.client_key, req.request_id))
     result = await scripts.limit_check(
         keys=keys,
-        args=[req.limit, window, req.cost, uuid.uuid4().hex],
+        args=[
+            req.limit,
+            window,
+            req.cost,
+            uuid.uuid4().hex,
+            settings.limits_max_window_ms,
+        ],
     )
 
     kind = result[0]

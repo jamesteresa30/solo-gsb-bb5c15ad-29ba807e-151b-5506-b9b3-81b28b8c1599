@@ -33,6 +33,9 @@ request_id 跨窗口可复用 / 非法 request_id 拒绝；
 （等到成本 4 滑出而非仅最早的成本 1），reset_at_ms 仍为最老记录滑出、
 按旧等待时长重试仍 429 / 等到位后放行，同毫秒到期记录合并判断
 （直连 Redis 构造同分记录验证）；
+以及混合窗口：同一 client_key 长窗口放行后换短窗口检查，仍属于长窗口
+的成本记录不得被删除（直连 Redis 验证记录与键 TTL）、切回长窗口仍计入
+额度（429）、每次判定只按本次 window_ms 累计、长窗口滑出后恢复；
 以及任务依赖门禁：
 无定义即可执行 / 保存去重且限 16 个 / 自身依赖 422 /
 环检测只遍历现有定义且拒绝时保留原定义 / 空列表清除 /
@@ -1303,6 +1306,7 @@ def limit_checks():
 
     idempotency_checks()
     limit_retry_after_checks()
+    mixed_window_checks()
 
 
 def idempotency_checks():
@@ -1561,6 +1565,85 @@ def limit_retry_after_checks():
               f"Retry-After={headers.get('Retry-After')} body={dm}")
     finally:
         r.close()
+
+
+def mixed_window_checks():
+    """/v1/limits/check 混合窗口回归：同一 client_key 交替使用不同 window_ms。
+
+    长窗口放行的成本记录必须按最大允许窗口保留：随后的短窗口检查既不得
+    删除该记录（ZSet 记录与键 TTL 都不得按短窗口收缩），切回长窗口后
+    该记录仍计入额度（429）；每次判定只按本次 window_ms 累计窗口内成本。"""
+    base = f"smoke-mixed-window:{int(time.time() * 1000)}"
+    path = "/v1/limits/check"
+    key = f"{base}:main"
+    long_window = 6_000
+    short_window = 1_000
+
+    # 1. 长窗口放行一笔成本 3（limit=3，恰好打满长窗口）
+    code, b1 = call("POST", path, {"client_key": key, "limit": 3,
+                                   "window_ms": long_window, "cost": 3})
+    check("mixed long-window allow cost 3",
+          code == 200 and b1["allowed"] and b1["remaining"] == 0, f"{code} {b1}")
+    long_reset = b1["reset_at_ms"]  # 成本 3 记录滑出长窗口的时刻
+
+    # 2. 拉开时间，使该记录早于随后的短窗口
+    time.sleep(1.5)
+
+    # 3. 短窗口检查：成本 3 记录不在 1s 窗口内 -> 按本次窗口放行；
+    #    关键：不得删除仍属于长窗口的记录，键 TTL 也不得按短窗口收缩
+    now_ms = int(time.time() * 1000)
+    code, b2 = call("POST", path, {"client_key": key, "limit": 3,
+                                   "window_ms": short_window, "cost": 1})
+    check("mixed short-window allow (record outside short window)",
+          code == 200 and b2["allowed"] and b2["remaining"] == 2, f"{code} {b2}")
+    check("mixed short-window reset ignores out-of-window record",
+          abs(b2["reset_at_ms"] - (now_ms + short_window)) < 1500, f"{b2}")
+
+    # 直连 Redis：长窗口的成本记录必须仍在 ZSet 中，且键 TTL 远大于短窗口
+    limit_prefix = os.environ.get("SMOKE_LIMIT_KEY_PREFIX", "ratelimit")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+    zkey = f"{limit_prefix}:{key}"
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("mixed redis reachable", False, f"{host}:{port} {exc}")
+        return
+    try:
+        members = r.execute("ZRANGE", zkey, 0, -1)
+        check("mixed short-window check keeps long-window record",
+              len(members) == 2
+              and any(str(m).endswith(":3") for m in members),
+              f"{members}")
+        pttl = r.execute("PTTL", zkey)
+        check("mixed key ttl not shrunk to short window",
+              isinstance(pttl, int) and pttl > 10_000, f"pttl={pttl}")
+    finally:
+        r.close()
+
+    # 4. 越过"旧实现会按短窗口设置键 TTL、导致整键过期"的时间点后切回长窗口：
+    #    成本 3 记录必须仍计入（used=3+1=4 > limit）-> 429，remaining 不为负
+    time.sleep(1.3)
+    code, headers, d = call_ex("POST", path, {"client_key": key, "limit": 3,
+                                              "window_ms": long_window, "cost": 1})
+    check("mixed back to long window -> 429 (record retained)",
+          code == 429 and not d["allowed"] and d["remaining"] == 0, f"{code} {d}")
+    # reset_at_ms 仍指向成本 3 记录滑出长窗口的时刻；retry_after 同样指向它
+    check("mixed long-window reset_at matches first record",
+          abs(d["reset_at_ms"] - long_reset) < 1500,
+          f"{d} expect {long_reset}")
+    now_ms = int(time.time() * 1000)
+    check("mixed long-window retry_after points at record slide-out",
+          long_reset - now_ms - 1500 < d["retry_after_ms"]
+          <= long_reset - now_ms + 1500,
+          f"{d} long_reset={long_reset} now={now_ms}")
+
+    # 5. 长窗口记录滑出后恢复：短窗口留下的成本 1 仍在长窗口内（used=1）
+    time.sleep(max(0.0, (long_reset - int(time.time() * 1000)) / 1000) + 0.5)
+    code, b3 = call("POST", path, {"client_key": key, "limit": 3,
+                                   "window_ms": long_window, "cost": 1})
+    check("mixed long-window recovers after slide-out",
+          code == 200 and b3["allowed"] and b3["remaining"] == 1, f"{code} {b3}")
 
 
 def set_dependencies(k, deps):
